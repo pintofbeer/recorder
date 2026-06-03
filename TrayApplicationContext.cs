@@ -17,6 +17,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem statusItem;
     private readonly ToolStripMenuItem watchedAppsItem;
     private readonly ToolStripMenuItem stopRecordingItem;
+    private readonly ToolStripMenuItem launchAtStartupItem;
     private readonly Icon appIcon;
     private readonly Icon trayIcon;
 
@@ -24,6 +25,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private RecordingTarget? activeTarget;
     private RecordingFiles? activeRecordingFiles;
     private int activePostProcessingTasks;
+    private string? lastObservedWindowTitleKey;
 
     public TrayApplicationContext()
     {
@@ -43,6 +45,10 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             Enabled = false
         };
+        launchAtStartupItem = new ToolStripMenuItem("Launch at startup", null, (_, _) => ToggleLaunchAtStartup())
+        {
+            CheckOnClick = false
+        };
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(statusItem);
@@ -53,6 +59,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(new ToolStripMenuItem("Tag speakers...", null, (_, _) => TagSpeakers()));
         menu.Items.Add(new ToolStripMenuItem("Edit watched apps", null, (_, _) => OpenSettingsFile()));
         menu.Items.Add(new ToolStripMenuItem("Reload watched apps", null, (_, _) => ReloadSettings(showNotification: true)));
+        menu.Items.Add(launchAtStartupItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("Exit", null, (_, _) => Exit()));
 
@@ -96,6 +103,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             if (activeTarget is not null)
             {
+                ObserveActiveForegroundTitle();
+
                 if (!processMonitor.IsStillOpenAndVisible(activeTarget))
                 {
                     StopRecording($"{activeTarget.DisplayName} closed or minimized");
@@ -125,7 +134,9 @@ public sealed class TrayApplicationContext : ApplicationContext
             focusedApp.WindowHandle,
             focusedApp.CaptureMicrophone);
 
-        activeRecordingFiles = recorder.Start(focusedApp.DisplayName, focusedApp.CaptureMicrophone);
+        activeRecordingFiles = recorder.Start(focusedApp.DisplayName, focusedApp.CaptureMicrophone, focusedApp.ProcessName);
+        lastObservedWindowTitleKey = null;
+        ObserveActiveForegroundTitle();
         AppLog.Info($"Recording started for {focusedApp.DisplayName}: {activeRecordingFiles.OutputPath}. Microphone: {focusedApp.CaptureMicrophone}");
         ShowNotification("Recording started", $"{focusedApp.DisplayName}\n{activeRecordingFiles.OutputPath}", ToolTipIcon.Info);
         UpdateMenuState();
@@ -142,6 +153,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         var files = recorder.Stop();
         activeTarget = null;
         activeRecordingFiles = null;
+        lastObservedWindowTitleKey = null;
 
         var title = stoppedTarget is null
             ? "Recording stopped"
@@ -247,11 +259,61 @@ public sealed class TrayApplicationContext : ApplicationContext
         }
 
         watchedAppsItem.Text = $"Watching: {WatchedAppsSummary()}";
+        launchAtStartupItem.Checked = StartupRegistration.IsEnabled();
     }
 
     private string WatchedAppsSummary()
     {
         return string.Join(", ", settings.WatchedApps.Select(app => app.DisplayName));
+    }
+
+    private void ToggleLaunchAtStartup()
+    {
+        try
+        {
+            var enabled = !StartupRegistration.IsEnabled();
+            StartupRegistration.SetEnabled(enabled);
+            UpdateMenuState();
+            ShowNotification(
+                enabled ? "Startup launch enabled" : "Startup launch disabled",
+                enabled ? "Recorder will start when you sign in." : "Recorder will not start automatically.",
+                ToolTipIcon.Info);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("Failed to update startup launch setting.", ex);
+            ShowNotification("Startup setting failed", ex.Message, ToolTipIcon.Error);
+        }
+    }
+
+    private void ObserveActiveForegroundTitle()
+    {
+        if (activeRecordingFiles is null)
+        {
+            return;
+        }
+
+        var foreground = processMonitor.GetForegroundWindowInfo();
+        if (foreground is null)
+        {
+            return;
+        }
+
+        var key = $"{foreground.ProcessName}\t{foreground.Title}";
+        if (string.Equals(key, lastObservedWindowTitleKey, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        lastObservedWindowTitleKey = key;
+        var observedAt = DateTimeOffset.UtcNow;
+        var offsetSeconds = Math.Max(0, (observedAt - activeRecordingFiles.StartedAtUtc).TotalSeconds);
+        activeRecordingFiles.WindowTitleObservations.Add(new WindowTitleObservation(
+            observedAt,
+            Math.Round(offsetSeconds, 3),
+            foreground.ProcessName,
+            foreground.Title));
+        AppLog.Info($"Observed foreground title during recording: {foreground.ProcessName}: {foreground.Title}");
     }
 
     private void ShowNotification(string title, string text, ToolTipIcon icon)

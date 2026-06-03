@@ -96,9 +96,12 @@ The app writes these files next to the recording:
 
 `meeting.json` is the canonical combined format. It includes:
 
+- meeting metadata with an inferred meeting name and observed foreground window titles
 - top-level speaker entries with embeddings and placeholder fields for later database resolution
 - transcript segments with `speakerId`, `speakerConfidence`, and placeholder resolved speaker fields
 - raw diarization turns for downstream reprocessing
+
+For Zoom and Microsoft Teams recordings, the app tracks foreground window title changes while recording. The meeting file stores those raw observations under `meeting.windowTitles` and writes the best conservative guess to `meeting.name` when a useful title can be inferred.
 
 ## Speaker Database
 
@@ -190,6 +193,8 @@ dotnet run
 ```
 
 Right-click the tray icon to open recordings, edit settings, reload settings, manually stop a recording, or exit.
+
+Use the tray menu's **Launch at startup** item to start the recorder automatically when you sign in. This uses the current user's Windows startup registry entry and does not require administrator rights. A Windows Service is not used because the recorder needs to run in the interactive desktop session to show the tray icon and monitor foreground windows.
 
 ## Troubleshooting
 

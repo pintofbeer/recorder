@@ -81,6 +81,7 @@ public sealed class MeetingComposer
             "recorder.meeting.v1",
             audioFilePath,
             CreateTracks(audioFilePath, recordingFiles),
+            CreateMeetingMetadata(recordingFiles),
             DateTimeOffset.UtcNow,
             new MeetingModels(diarization.Model, voiceprints.EmbeddingModel),
             speakers,
@@ -113,6 +114,103 @@ public sealed class MeetingComposer
         }
 
         return tracks;
+    }
+
+    private static MeetingMetadata? CreateMeetingMetadata(RecordingFiles? recordingFiles)
+    {
+        if (recordingFiles is null)
+        {
+            return null;
+        }
+
+        var observations = recordingFiles.WindowTitleObservations
+            .Where(observation => !string.IsNullOrWhiteSpace(observation.Title))
+            .ToList();
+
+        return new MeetingMetadata(
+            recordingFiles.AppDisplayName,
+            recordingFiles.AppProcessName,
+            InferMeetingName(recordingFiles.AppDisplayName, recordingFiles.AppProcessName, observations),
+            recordingFiles.StartedAtUtc,
+            observations);
+    }
+
+    private static string? InferMeetingName(string appDisplayName, string? appProcessName, IReadOnlyList<WindowTitleObservation> observations)
+    {
+        var appTokens = appDisplayName.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var appObservations = string.IsNullOrWhiteSpace(appProcessName)
+            ? observations
+            : observations
+                .Where(observation => string.Equals(observation.ProcessName, appProcessName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+        return appObservations
+            .Select(observation => NormalizeMeetingTitle(observation.Title))
+            .Where(title => IsUsefulMeetingTitle(title, appTokens))
+            .GroupBy(title => title, StringComparer.OrdinalIgnoreCase)
+            .Select(group => new
+            {
+                Title = group.First(),
+                Count = group.Count()
+            })
+            .OrderByDescending(candidate => candidate.Count)
+            .ThenByDescending(candidate => candidate.Title.Length)
+            .FirstOrDefault()
+            ?.Title;
+    }
+
+    private static string NormalizeMeetingTitle(string title)
+    {
+        var normalized = title.Trim();
+        var suffixes = new[]
+        {
+            " - Zoom",
+            " - Zoom Workplace",
+            " | Microsoft Teams",
+            " | Teams",
+            " - Microsoft Teams",
+            " - Teams"
+        };
+
+        foreach (var suffix in suffixes)
+        {
+            if (normalized.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            {
+                normalized = normalized[..^suffix.Length].Trim();
+                break;
+            }
+        }
+
+        return normalized;
+    }
+
+    private static bool IsUsefulMeetingTitle(string title, IReadOnlyList<string> appTokens)
+    {
+        if (title.Length < 4)
+        {
+            return false;
+        }
+
+        var genericTitles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Zoom",
+            "Zoom Meeting",
+            "Zoom Workplace",
+            "Microsoft Teams",
+            "Teams",
+            "Meeting",
+            "Calendar",
+            "Chat",
+            "Calls",
+            "Activity"
+        };
+
+        if (genericTitles.Contains(title))
+        {
+            return false;
+        }
+
+        return appTokens.All(token => !string.Equals(title, token, StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task<T> ReadJsonAsync<T>(string path, CancellationToken cancellationToken)
@@ -247,6 +345,7 @@ public sealed record MeetingDocument
         string schema,
         string audio,
         IReadOnlyList<MeetingAudioTrack>? tracks,
+        MeetingMetadata? meeting,
         DateTimeOffset createdAt,
         MeetingModels models,
         IReadOnlyList<MeetingSpeaker> speakers,
@@ -256,6 +355,7 @@ public sealed record MeetingDocument
         Schema = schema;
         Audio = audio;
         Tracks = tracks ?? [new MeetingAudioTrack("mixed", audio, "Processing audio used for transcription and diarization.")];
+        Meeting = meeting;
         CreatedAt = createdAt;
         Models = models;
         Speakers = speakers;
@@ -271,6 +371,9 @@ public sealed record MeetingDocument
 
     [JsonPropertyName("tracks")]
     public IReadOnlyList<MeetingAudioTrack> Tracks { get; init; }
+
+    [JsonPropertyName("meeting")]
+    public MeetingMetadata? Meeting { get; init; }
 
     [JsonPropertyName("createdAt")]
     public DateTimeOffset CreatedAt { get; init; }
@@ -292,6 +395,13 @@ public sealed record MeetingAudioTrack(
     [property: JsonPropertyName("type")] string Type,
     [property: JsonPropertyName("path")] string Path,
     [property: JsonPropertyName("description")] string Description);
+
+public sealed record MeetingMetadata(
+    [property: JsonPropertyName("application")] string Application,
+    [property: JsonPropertyName("processName")] string? ProcessName,
+    [property: JsonPropertyName("name")] string? Name,
+    [property: JsonPropertyName("startedAt")] DateTimeOffset StartedAt,
+    [property: JsonPropertyName("windowTitles")] IReadOnlyList<WindowTitleObservation> WindowTitles);
 
 public sealed record MeetingModels(
     [property: JsonPropertyName("diarization")] string? Diarization,

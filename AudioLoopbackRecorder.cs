@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 
@@ -10,11 +11,14 @@ public sealed class AudioLoopbackRecorder : IDisposable
     private WaveFileWriter? outputWriter;
     private WaveFileWriter? microphoneWriter;
     private RecordingFiles? currentFiles;
+    private Stopwatch? recordingClock;
+    private CaptureTimeline? outputTimeline;
+    private CaptureTimeline? microphoneTimeline;
 
     public bool IsRecording => outputCapture is not null;
     public RecordingFiles? CurrentFiles => currentFiles;
 
-    public RecordingFiles Start(string displayName, bool captureMicrophone)
+    public RecordingFiles Start(string displayName, bool captureMicrophone, string? processName = null)
     {
         if (IsRecording)
         {
@@ -29,10 +33,14 @@ public sealed class AudioLoopbackRecorder : IDisposable
             $"{SanitizeFileName(displayName)}-{DateTime.Now:yyyyMMdd-HHmmss}");
 
         currentFiles = new RecordingFiles(
+            displayName,
+            processName,
             $"{basePath}.wav",
             captureMicrophone ? $"{basePath}.mic.wav" : null,
-            captureMicrophone ? $"{basePath}.merged.wav" : $"{basePath}.wav");
+            captureMicrophone ? $"{basePath}.merged.wav" : $"{basePath}.wav",
+            DateTimeOffset.UtcNow);
 
+        recordingClock = Stopwatch.StartNew();
         StartOutputCapture(currentFiles.OutputPath);
 
         if (captureMicrophone && WaveIn.DeviceCount > 0)
@@ -77,11 +85,11 @@ public sealed class AudioLoopbackRecorder : IDisposable
     {
         outputCapture = new WasapiLoopbackCapture();
         outputWriter = new WaveFileWriter(outputPath, outputCapture.WaveFormat);
+        outputTimeline = new CaptureTimeline("system output", outputCapture.WaveFormat);
 
         outputCapture.DataAvailable += (_, args) =>
         {
-            outputWriter?.Write(args.Buffer, 0, args.BytesRecorded);
-            outputWriter?.Flush();
+            WriteAligned(outputWriter, outputTimeline, args.Buffer, args.BytesRecorded);
         };
 
         outputCapture.RecordingStopped += (_, _) =>
@@ -100,11 +108,11 @@ public sealed class AudioLoopbackRecorder : IDisposable
             WaveFormat = new WaveFormat(16000, 16, 1)
         };
         microphoneWriter = new WaveFileWriter(microphonePath, microphoneCapture.WaveFormat);
+        microphoneTimeline = new CaptureTimeline("microphone", microphoneCapture.WaveFormat);
 
         microphoneCapture.DataAvailable += (_, args) =>
         {
-            microphoneWriter?.Write(args.Buffer, 0, args.BytesRecorded);
-            microphoneWriter?.Flush();
+            WriteAligned(microphoneWriter, microphoneTimeline, args.Buffer, args.BytesRecorded);
         };
 
         microphoneCapture.RecordingStopped += (_, _) =>
@@ -113,6 +121,49 @@ public sealed class AudioLoopbackRecorder : IDisposable
             microphoneWriter = null;
         };
         microphoneCapture.StartRecording();
+    }
+
+    private void WriteAligned(WaveFileWriter? writer, CaptureTimeline? timeline, byte[] buffer, int bytesRecorded)
+    {
+        if (writer is null || timeline is null || recordingClock is null || bytesRecorded <= 0)
+        {
+            return;
+        }
+
+        lock (timeline.SyncRoot)
+        {
+            var packetDuration = timeline.BytesToSeconds(bytesRecorded);
+            var packetStart = Math.Max(0, recordingClock.Elapsed.TotalSeconds - packetDuration);
+            var currentTimelinePosition = timeline.BytesToSeconds(timeline.BytesWritten);
+            var missingSeconds = packetStart - currentTimelinePosition;
+
+            if (timeline.BytesWritten == 0 || missingSeconds > 0.05)
+            {
+                var silenceBytes = timeline.SecondsToAlignedBytes(Math.Max(0, missingSeconds));
+                if (silenceBytes > 0)
+                {
+                    WriteSilence(writer, silenceBytes);
+                    timeline.BytesWritten += silenceBytes;
+                    AppLog.Info($"Inserted {timeline.BytesToSeconds(silenceBytes):0.000}s of alignment silence into {timeline.Name} track.");
+                }
+            }
+
+            writer.Write(buffer, 0, bytesRecorded);
+            writer.Flush();
+            timeline.BytesWritten += bytesRecorded;
+        }
+    }
+
+    private static void WriteSilence(WaveFileWriter writer, int byteCount)
+    {
+        var silence = new byte[Math.Min(byteCount, 64 * 1024)];
+        var remaining = byteCount;
+        while (remaining > 0)
+        {
+            var chunk = Math.Min(remaining, silence.Length);
+            writer.Write(silence, 0, chunk);
+            remaining -= chunk;
+        }
     }
 
     private static void MergeToMono(string outputPath, string microphonePath, string mergedPath)
@@ -174,6 +225,35 @@ public sealed class AudioLoopbackRecorder : IDisposable
         microphoneCapture?.Dispose();
         microphoneCapture = null;
 
+        recordingClock = null;
+        outputTimeline = null;
+        microphoneTimeline = null;
         currentFiles = null;
+    }
+
+    private sealed class CaptureTimeline(string name, WaveFormat waveFormat)
+    {
+        public string Name { get; } = name;
+        public WaveFormat WaveFormat { get; } = waveFormat;
+        public object SyncRoot { get; } = new();
+        public long BytesWritten { get; set; }
+
+        public double BytesToSeconds(long byteCount)
+        {
+            return byteCount / (double)WaveFormat.AverageBytesPerSecond;
+        }
+
+        public int SecondsToAlignedBytes(double seconds)
+        {
+            if (seconds <= 0)
+            {
+                return 0;
+            }
+
+            var bytes = (long)Math.Round(seconds * WaveFormat.AverageBytesPerSecond);
+            var blockAlign = Math.Max(1, WaveFormat.BlockAlign);
+            bytes -= bytes % blockAlign;
+            return bytes > int.MaxValue ? int.MaxValue : (int)bytes;
+        }
     }
 }

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 
 namespace Recorder;
 
@@ -47,6 +48,36 @@ public sealed class ProcessMonitor
             : new FocusedWatchedApp(watchedApp.DisplayName, process.Id, processName, foregroundWindow, watchedApp.CaptureMicrophone);
     }
 
+    public ForegroundWindowInfo? GetForegroundWindowInfo()
+    {
+        var foregroundWindow = NativeMethods.GetForegroundWindow();
+        if (foregroundWindow == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        NativeMethods.GetWindowThreadProcessId(foregroundWindow, out var processId);
+        if (processId == 0)
+        {
+            return null;
+        }
+
+        string processName;
+        try
+        {
+            processName = Process.GetProcessById((int)processId).ProcessName;
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+
+        var title = GetWindowTitle(foregroundWindow);
+        return string.IsNullOrWhiteSpace(title)
+            ? null
+            : new ForegroundWindowInfo(processName, foregroundWindow, title);
+    }
+
     public bool IsStillOpenAndVisible(RecordingTarget target)
     {
         try
@@ -74,8 +105,23 @@ public sealed class ProcessMonitor
             return false;
         }
     }
+
+    private static string GetWindowTitle(IntPtr windowHandle)
+    {
+        var length = NativeMethods.GetWindowTextLengthW(windowHandle);
+        if (length <= 0)
+        {
+            return "";
+        }
+
+        var builder = new StringBuilder(length + 1);
+        _ = NativeMethods.GetWindowTextW(windowHandle, builder, builder.Capacity);
+        return builder.ToString().Trim();
+    }
 }
 
 public sealed record FocusedWatchedApp(string DisplayName, int ProcessId, string ProcessName, IntPtr WindowHandle, bool CaptureMicrophone);
 
 public sealed record RecordingTarget(string DisplayName, int ProcessId, string ProcessName, IntPtr WindowHandle, bool CaptureMicrophone);
+
+public sealed record ForegroundWindowInfo(string ProcessName, IntPtr WindowHandle, string Title);
